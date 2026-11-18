@@ -1,4 +1,4 @@
-import os,logging
+import os,logging,json
 from contextlib import asynccontextmanager
 import redis
 from fastapi import FastAPI,Depends,HTTPException
@@ -10,6 +10,8 @@ from .models import User,Production,Performance,CrewCall,Audit
 from .auth import current,writers,admin,verify,token
 from .schemas import Login,ProductionInput,PerformanceInput,ArrivalInput,CrewInput
 from .services import get,pack,audit,history,validate_history,invalidate,save_crew,confirm
+from .evaluation_service import active_method
+from .evaluation_routes import router as evaluation_router
 from .middlewares import RequestTrace,BurstGuard
 from .frontdesk_routes import router as frontdesk_router
 from .house_routes import router as house_router
@@ -27,6 +29,7 @@ async def lifespan(app):
 app=FastAPI(title='南岸 · 场次上座与场务点名',lifespan=lifespan)
 app.include_router(frontdesk_router)
 app.include_router(house_router)
+app.include_router(evaluation_router)
 app.add_middleware(RequestTrace);app.add_middleware(BurstGuard)
 @app.exception_handler(IntegrityError)
 async def conflict(req,exc):return JSONResponse({'detail':'剧目编号、场次日期或点名单重复，请选择已有记录修订'},409)
@@ -75,8 +78,11 @@ def forecast(pid:int,s=Depends(db_session),u=Depends(writers)):
     if not prod:raise HTTPException(404,'剧目不存在')
     if s.scalar(select(Performance.id).where(Performance.production_id==pid,Performance.status=='crew_confirmed')):raise HTTPException(409,'已有确认点名，预测证据已冻结')
     if prod.forecast_state=='calculating':raise HTTPException(409,'预测进行中')
-    validate_history(history(s,pid));invalidate(s,prod);prod.forecast_state='calculating';audit(s,u,'预测入队 '+prod.code);s.commit()
-    try:r.rpush('theatre-forecast',pid)
+    validate_history(history(s,pid));invalidate(s,prod)
+    # 入队时刻固定方案：已排队预测沿用入队方案，启用新版只影响之后的新预测。
+    method_key=active_method(s,pid)
+    prod.forecast_state='calculating';audit(s,u,'预测入队 '+prod.code+' / '+method_key);s.commit()
+    try:r.rpush('theatre-forecast',json.dumps({'production_id':pid,'method_key':method_key}))
     except Exception:prod.forecast_state='failed';s.commit();raise HTTPException(503,'预测队列暂不可用，请重试')
     return pack(prod)
 @app.get('/crew-calls')
